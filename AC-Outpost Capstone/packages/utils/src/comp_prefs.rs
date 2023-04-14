@@ -2,6 +2,8 @@ use cosmwasm_schema::cw_serde;
 use cosmwasm_std::Decimal;
 use wyndex::asset::AssetInfo;
 
+use crate::errors::OutpostError;
+
 #[cw_serde]
 pub struct CompoundPrefs {
     pub relative: Vec<DestinationAction>,
@@ -9,12 +11,15 @@ pub struct CompoundPrefs {
 
 #[cw_serde]
 pub struct DestinationAction {
-    pub destination: DestinationProject,
-    pub amount: RelativeQty,
+    pub destination: JunoDestinationProject,
+    /// the percentage of the rewards that should be sent to this destination
+    /// this is a number with 18 decimal places
+    /// for example "250000000000000000" is 25%
+    pub amount: u128,
 }
 
 #[cw_serde]
-pub enum DestinationProject {
+pub enum JunoDestinationProject {
     JunoStaking {
         validator_address: String,
     },
@@ -29,12 +34,6 @@ pub enum DestinationProject {
         target_denom: AssetInfo,
     },
     NetaStaking {},
-}
-
-#[cw_serde]
-// percentage using 18 decimal places
-pub struct RelativeQty {
-    pub quantity: u128,
 }
 
 #[cw_serde]
@@ -80,5 +79,71 @@ impl From<WyndLPBondingPeriod> for u64 {
             WyndLPBondingPeriod::TwentyEightDays => 2419200,
             WyndLPBondingPeriod::FourtyTwoDays => 3628800,
         }
+    }
+}
+// implement try_from for u64 to WyndLPBondingPeriod
+impl TryFrom<u64> for WyndLPBondingPeriod {
+    type Error = OutpostError;
+
+    fn try_from(v: u64) -> Result<Self, Self::Error> {
+        match v {
+            604800 => Ok(WyndLPBondingPeriod::SevenDays),
+            1209600 => Ok(WyndLPBondingPeriod::FourteenDays),
+            2419200 => Ok(WyndLPBondingPeriod::TwentyEightDays),
+            3628800 => Ok(WyndLPBondingPeriod::FourtyTwoDays),
+            _ => Err(OutpostError::InvalidBondingPeriod(v.to_string())),
+        }
+    }
+}
+
+#[cw_serde]
+/// compound prefs for a specific pool
+pub struct PoolCompoundPrefs {
+    pub pool_address: String,
+    pub comp_prefs: CompoundPrefs,
+}
+
+#[cw_serde]
+/// compound prefs for all of the pools that have rewards and were not
+/// individually specified
+pub struct PoolCatchAllDestinationAction {
+    pub destination: PoolCatchAllDestinationProject,
+    /// the percentage of the rewards that should be sent to this destination
+    /// this is a number with 18 decimal places
+    /// for example "250000000000000000" is 25%
+    pub amount: u128,
+}
+
+#[cw_serde]
+/// Compound prefs for a catch all pools that were not individually specified.
+/// The main difference between this and the normal DestinationProject is that
+/// in the catch all you have the ability to specify sending the rewards back to the pool
+/// it came from instead of needing to specify any static destination
+pub enum PoolCatchAllDestinationProject {
+    BasicDestination(JunoDestinationProject),
+    /// send pool rewards back to the pool that generated the rewards
+    ReturnToPool,
+}
+
+impl From<DestinationAction> for PoolCatchAllDestinationAction {
+    fn from(
+        DestinationAction {
+            destination,
+            amount,
+        }: DestinationAction,
+    ) -> Self {
+        PoolCatchAllDestinationAction {
+            destination: PoolCatchAllDestinationProject::BasicDestination(destination),
+            amount,
+        }
+    }
+}
+
+impl From<CompoundPrefs> for Vec<PoolCatchAllDestinationAction> {
+    fn from(CompoundPrefs { relative }: CompoundPrefs) -> Self {
+        relative
+            .into_iter()
+            .map(PoolCatchAllDestinationAction::from)
+            .collect()
     }
 }

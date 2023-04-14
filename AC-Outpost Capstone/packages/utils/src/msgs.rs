@@ -1,3 +1,4 @@
+use cosmos_sdk_proto::cosmos::authz::v1beta1::{GenericAuthorization, Grant, MsgGrant};
 use cosmos_sdk_proto::cosmos::distribution::v1beta1::MsgWithdrawDelegatorReward;
 use cosmos_sdk_proto::cosmos::staking::v1beta1::MsgDelegate;
 use cosmos_sdk_proto::cosmos::{authz::v1beta1::MsgExec, base::v1beta1::Coin};
@@ -8,7 +9,7 @@ use cosmos_sdk_proto::Any;
 
 use cosmwasm_std::{to_binary, Addr, Binary, CosmosMsg, QuerierWrapper, StdError, Uint128};
 use serde::Serialize;
-use wyndex::asset::AssetInfo;
+use wyndex::asset::{AssetInfo, AssetValidated};
 
 #[derive(Debug, Clone, PartialEq)]
 pub enum CosmosProtoMsg {
@@ -51,6 +52,53 @@ where
         msg: to_binary(&msg)?.to_vec(),
         funds: funds.unwrap_or_default(),
     })
+}
+
+pub enum GenericAuthorizationType {
+    WithdrawDelegatorRewards,
+    Delegation,
+}
+
+impl From<GenericAuthorizationType> for Any {
+    fn from(proto: GenericAuthorizationType) -> Any {
+        match proto {
+            GenericAuthorizationType::WithdrawDelegatorRewards => Any {
+                type_url: "/cosmos.authz.v1beta1.GenericAuthorization".to_string(),
+                value: GenericAuthorization {
+                    msg: "/cosmos.distribution.v1beta1.MsgWithdrawDelegatorReward".to_string(),
+                }
+                .encode_to_vec(),
+            },
+            GenericAuthorizationType::Delegation => Any {
+                type_url: "/cosmos.authz.v1beta1.GenericAuthorization".to_string(),
+                value: GenericAuthorization {
+                    msg: "/cosmos.staking.v1beta1.MsgDelegate".to_string(),
+                }
+                .encode_to_vec(),
+            },
+        }
+    }
+}
+
+/// Creates a Generic MsgGrant message
+pub fn create_generic_grant_msg(
+    granter: String,
+    grantee: &Addr,
+    grant_type: GenericAuthorizationType,
+) -> CosmosMsg {
+    let grant = MsgGrant {
+        grantee: grantee.to_string(),
+        granter,
+        grant: Some(Grant {
+            authorization: Some(grant_type.into()),
+            expiration: None,
+        }),
+    };
+
+    CosmosMsg::Stargate {
+        type_url: "/cosmos.authz.v1beta1.MsgGrant".to_string(),
+        value: Binary::from(grant.encode_to_vec()),
+    }
 }
 
 /// Creates a MsgExec message
@@ -99,12 +147,17 @@ pub fn create_wyndex_swap_msg(
     offer_asset: AssetInfo,
     ask_asset_info: AssetInfo,
     multihop_address: String,
-) -> Result<CosmosProtoMsg, StdError> {
+) -> Result<Vec<CosmosProtoMsg>, StdError> {
+    // no swap to do because the offer and ask tokens are the same
+    if offer_asset.eq(&ask_asset_info) {
+        return Ok(vec![]);
+    }
+
     let swap_ops = create_wyndex_swap_operations(offer_asset.clone(), ask_asset_info);
 
     match offer_asset {
-        AssetInfo::Native(offer_denom) => {
-            Ok(CosmosProtoMsg::ExecuteContract(create_exec_contract_msg(
+        AssetInfo::Native(offer_denom) => Ok(vec![CosmosProtoMsg::ExecuteContract(
+            create_exec_contract_msg(
                 multihop_address,
                 sender,
                 &swap_ops,
@@ -112,10 +165,10 @@ pub fn create_wyndex_swap_msg(
                     amount: offer_amount.to_string(),
                     denom: offer_denom,
                 }]),
-            )?))
-        }
-        AssetInfo::Token(ask_token_contract_address) => {
-            Ok(CosmosProtoMsg::ExecuteContract(create_exec_contract_msg(
+            )?,
+        )]),
+        AssetInfo::Token(ask_token_contract_address) => Ok(vec![CosmosProtoMsg::ExecuteContract(
+            create_exec_contract_msg(
                 ask_token_contract_address,
                 sender,
                 &cw20::Cw20ExecuteMsg::Send {
@@ -124,8 +177,8 @@ pub fn create_wyndex_swap_msg(
                     msg: to_binary(&swap_ops)?,
                 },
                 None,
-            )?))
-        }
+            )?,
+        )]),
     }
 }
 
@@ -138,7 +191,12 @@ pub fn create_wyndex_swap_msg_with_simulation(
     offer_asset: AssetInfo,
     ask_asset_info: AssetInfo,
     multihop_address: String,
-) -> Result<(CosmosProtoMsg, Uint128), StdError> {
+) -> Result<(Vec<CosmosProtoMsg>, Uint128), StdError> {
+    // no swap to do because the offer and ask tokens are the same
+    if offer_asset.eq(&ask_asset_info) {
+        return Ok((vec![], offer_amount));
+    }
+
     let swap_ops = create_wyndex_swap_operations(offer_asset.clone(), ask_asset_info);
 
     let simulated_swap: wyndex::pair::SimulationResponse;
@@ -186,7 +244,52 @@ pub fn create_wyndex_swap_msg_with_simulation(
         }
     }
     Ok((
-        CosmosProtoMsg::ExecuteContract(exec),
+        vec![CosmosProtoMsg::ExecuteContract(exec)],
         simulated_swap.return_amount,
     ))
+}
+
+pub struct SwapSimResponse {
+    pub swap_msgs: Vec<CosmosProtoMsg>,
+    pub asset: AssetInfo,
+    pub simulated_return_amount: Uint128,
+}
+
+/// Creates a MsgExecuteContract for doing multiple token swaps on Wyndex via the multihop router
+/// also returning the simulated resultant token amounts
+pub fn create_wyndex_swaps_with_sims(
+    querier: &QuerierWrapper,
+    delegator_addr: &Addr,
+    offer_assets: Vec<AssetValidated>,
+    ask_asset: AssetInfo,
+    multihop_address: String,
+) -> Result<SwapSimResponse, StdError> {
+    let swaps_and_sims = offer_assets
+        .into_iter()
+        .map(|AssetValidated { info, amount }| {
+            create_wyndex_swap_msg_with_simulation(
+                querier,
+                delegator_addr,
+                amount,
+                info.into(),
+                ask_asset.clone(),
+                multihop_address.to_string(),
+            )
+        })
+        .collect::<Result<Vec<_>, StdError>>()?;
+
+    let (swap_msgs, simulated_return_amount) = swaps_and_sims.into_iter().fold(
+        (vec![], Uint128::zero()),
+        |(mut swaps, mut sim_total), (swap, sim)| {
+            swaps.extend(swap);
+            sim_total += sim;
+            (swaps, sim_total)
+        },
+    );
+
+    Ok(SwapSimResponse {
+        swap_msgs,
+        asset: ask_asset,
+        simulated_return_amount,
+    })
 }
